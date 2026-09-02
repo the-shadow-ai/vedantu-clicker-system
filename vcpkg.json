@@ -1,0 +1,19 @@
+{
+  "name": "student-voting-system",
+  "version": "1.0.0",
+  "description": "Real-time Student Voting System with SunVote clicker hardware integration",
+  "dependencies": [
+    "nlohmann-json",
+    "spdlog",
+    "openssl",
+    {
+      "name": "curl",
+      "features": ["ssl"]
+    },
+    "ixwebsocket",
+    {
+      "name": "imgui",
+      "features": ["dx11-binding", "win32-binding"]
+    }
+  ]
+}
