@@ -34,7 +34,6 @@
 #include <condition_variable>
 #include <functional>
 #include <mutex>
-#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -58,8 +57,6 @@ public:
                   HttpClient &http, UiState &ui_state)
       : session_mgr_(session_mgr), queue_(queue), offline_(offline),
         api_url_(cfg.require("API_BASE_URL") + cfg.require("API_POST_ENDPOINT")),
-        max_retries_(cfg.getInt("API_MAX_RETRIES", 10)),
-        retry_base_ms_(cfg.getInt("API_RETRY_BASE_MS", 30)),
         hmac_enabled_(cfg.getBool("HMAC_ENABLED", false)),
         hmac_signer_(cfg.getBool("HMAC_ENABLED", false)
                          ? std::make_unique<HmacSigner>(cfg.get("HMAC_SECRET_ENV_VAR", ""))
@@ -193,7 +190,7 @@ private:
         // The generation stamp lets the thread self-abort if the session
         // changes while it is sleeping through an exponential back-off retry.
         std::thread([this, ev = std::move(ev), gen] {
-          postWithRetry(ev, gen);
+          postOnce(ev, gen);
         }).detach();
       }
     }
@@ -216,21 +213,36 @@ private:
           Logger::api()->warn("[Dispatcher] FlushLoop: skipping stale sn={}", ev.serial_no);
           return;
         }
-        postWithRetry(ev, gen);
+        postOnce(ev, gen);
       });
     }
   }
 
-  // ── HTTP post with exponential back-off ──────────────────────────────────
+  // ── HTTP post — single attempt, immediate offline on failure ─────────────
   //
-  // @param gen  Session generation captured at dispatch time.  If generation_
-  //             has advanced beyond this value when a retry is about to fire,
-  //             the function aborts immediately.  This prevents in-flight retry
-  //             threads from a previous quiz question posting the wrong value
-  //             over a correct answer in the current quiz question.
-  void postWithRetry(const ClickEvent &ev, uint64_t gen) {
+  // One attempt only. Any failure (network error, non-2xx status, or stale
+  // session generation) sends the event immediately to the encrypted offline
+  // queue. The flushLoop replays offline events every 5 s when the session
+  // is valid and connectivity is restored.
+  //
+  // @param gen  Session generation captured at dispatch time. If generation_
+  //             has advanced (operator re-validated mid-quiz), this thread
+  //             aborts without posting — the new session's drain loop is
+  //             already handling the correct events.
+  void postOnce(const ClickEvent &ev, uint64_t gen) {
+    // ── Generation check ─────────────────────────────────────────────────
+    if (generation_.load(std::memory_order_relaxed) != gen) {
+      Logger::api()->warn(
+          "[API] Discarding sn={} — session generation changed "
+          "(was gen={}, now gen={})",
+          ev.serial_no, gen,
+          generation_.load(std::memory_order_relaxed));
+      return; // do NOT enqueue offline — belongs to a stale session
+    }
+
     auto info = session_mgr_.getInfo();
     if (!info.valid) {
+      Logger::api()->warn("[API] sn={} — session invalid, going offline", ev.serial_no);
       offline_.enqueue(ev);
       return;
     }
@@ -241,64 +253,37 @@ private:
 
     auto t0 = std::chrono::steady_clock::now();
 
-    // Jitter: ±20% of base delay prevents thunderstorm retries from many
-    // classrooms all failing and retrying at exactly the same interval.
-    thread_local std::mt19937 rng{std::random_device{}()};
-    long delay_ms = retry_base_ms_;
+    try {
+      auto resp = http_.post(api_url_, body);
 
-    for (int attempt = 0; attempt <= max_retries_; ++attempt) {
-      // ─ Generation check ────────────────────────────────────────────
-      // If the session has been re-validated (e.g. operator clicked VALIDATE
-      // again mid-quiz), our generation stamp is stale.  The new session's
-      // drain loop is already dispatching the correct events, so we must not
-      // let this retry overwrite them with the old value.
-      if (generation_.load(std::memory_order_relaxed) != gen) {
-        Logger::api()->warn(
-            "[API] Aborting retry sn={} — session generation changed "
-            "(was gen={}, now gen={})",
-            ev.serial_no, gen,
-            generation_.load(std::memory_order_relaxed));
-        return;
-      }
+      auto t1         = std::chrono::steady_clock::now();
+      int64_t latency = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
 
-      try {
-        auto resp = http_.post(api_url_, body);
-
-        auto t1         = std::chrono::steady_clock::now();
-        int64_t latency = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
-
-        if (resp.ok()) {
-          auto api_done_ts = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                 std::chrono::system_clock::now().time_since_epoch())
-                                 .count();
-          Logger::perf()->info("[API] sn={} device={} value={} → HTTP {} latency={}ms",
-                               ev.serial_no, ev.device_sn, ev.value,
-                               resp.status_code, latency);
-          ui_state_.updateEventLatency(ev.serial_no,
-                                       static_cast<int>(resp.status_code),
-                                       latency);
-          latencyLog().recordApiDone(ev.serial_no,
+      if (resp.ok()) {
+        auto api_done_ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+        Logger::perf()->info("[API] sn={} device={} value={} → HTTP {} latency={}ms",
+                             ev.serial_no, ev.device_sn, ev.value,
+                             resp.status_code, latency);
+        ui_state_.updateEventLatency(ev.serial_no,
                                      static_cast<int>(resp.status_code),
-                                     api_done_ts);
-          return; // success
-        }
-
-        Logger::api()->warn("[API] HTTP {} for sn={} attempt={}/{}",
-                            resp.status_code, ev.serial_no, attempt + 1, max_retries_);
-      } catch (const std::exception &e) {
-        Logger::errors()->warn("[API] Exception sn={} attempt={}: {}",
-                               ev.serial_no, attempt + 1, e.what());
+                                     latency);
+        latencyLog().recordApiDone(ev.serial_no,
+                                   static_cast<int>(resp.status_code),
+                                   api_done_ts);
+        return; // ✓ success
       }
 
-      if (attempt < max_retries_) {
-        std::uniform_int_distribution<long> jitter(-(delay_ms / 5), delay_ms / 5);
-        std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms + jitter(rng)));
-        delay_ms = std::min(delay_ms * 2, 30000L);
-      }
+      // Non-2xx → offline immediately
+      Logger::api()->warn("[API] HTTP {} for sn={} — going offline immediately",
+                          resp.status_code, ev.serial_no);
+    } catch (const std::exception &e) {
+      // Network/TLS error → offline immediately
+      Logger::errors()->warn("[API] Exception sn={}: {} — going offline immediately",
+                             ev.serial_no, e.what());
     }
 
-    Logger::errors()->error("[API] sn={} failed after {} retries, persisting offline",
-                            ev.serial_no, max_retries_);
     offline_.enqueue(ev);
   }
 
@@ -307,8 +292,6 @@ private:
   LockFreeQueue<ClickEvent>   &queue_;
   OfflineQueue                &offline_;
   std::string                  api_url_;
-  int                          max_retries_;
-  long                         retry_base_ms_;
   bool                         hmac_enabled_;
   std::unique_ptr<HmacSigner>  hmac_signer_;
   HttpClient                  &http_;
